@@ -442,10 +442,15 @@ SubstitutionParamMapping::need_substitution () const
 }
 
 bool
-SubstitutionParamMapping::fill_param_ty (BaseType &type, Location locus)
+SubstitutionParamMapping::fill_param_ty (
+  SubstitutionArgumentMappings &subst_mappings, Location locus)
 {
-  auto context = Resolver::TypeCheckContext::get ();
+  SubstitutionArg arg = SubstitutionArg::error ();
+  bool ok = subst_mappings.get_argument_for_symbol (get_param_ty (), &arg);
+  if (!ok)
+    return true;
 
+  TyTy::BaseType &type = *arg.get_tyty ();
   if (type.get_kind () == TyTy::TypeKind::INFER)
     {
       type.inherit_bounds (*param);
@@ -467,43 +472,9 @@ SubstitutionParamMapping::fill_param_ty (BaseType &type, Location locus)
       if (!param->bounds_compatible (type, locus, true))
 	return false;
 
-      // setup any associated type mappings for the specified bonds and this
-      // type
-      auto candidates = Resolver::TypeBoundsProbe::Probe (&type);
-      for (auto &specified_bound : param->get_specified_bounds ())
-	{
-	  const Resolver::TraitReference *specified_bound_ref
-	    = specified_bound.get ();
-
-	  // since the bounds_compatible check has occurred we should be able to
-	  // assert on finding the trait references
-	  HirId associated_impl_block_id = UNKNOWN_HIRID;
-	  bool found = false;
-	  for (auto &bound : candidates)
-	    {
-	      const Resolver::TraitReference *bound_trait_ref = bound.first;
-	      const HIR::ImplBlock *associated_impl = bound.second;
-
-	      found = specified_bound_ref->is_equal (*bound_trait_ref);
-	      if (found)
-		{
-		  rust_assert (associated_impl != nullptr);
-		  associated_impl_block_id
-		    = associated_impl->get_mappings ().get_hirid ();
-		  break;
-		}
-	    }
-
-	  if (found && associated_impl_block_id != UNKNOWN_HIRID)
-	    {
-	      Resolver::AssociatedImplTrait *lookup_associated = nullptr;
-	      bool found_impl_trait = context->lookup_associated_trait_impl (
-		associated_impl_block_id, &lookup_associated);
-
-	      if (found_impl_trait)
-		lookup_associated->setup_associated_types ();
-	    }
-	}
+      // recursively pass this down to all HRTB's
+      for (auto &bound : param->get_specified_bounds ())
+	bound.handle_substitions (subst_mappings);
 
       param->set_ty_ref (type.get_ref ());
     }
@@ -773,6 +744,65 @@ SubstitutionRef::solve_missing_mappings_from_this (SubstitutionRef &ref,
   return SubstitutionArgumentMappings (resolved_mappings, locus);
 }
 
+bool
+SubstitutionRef::monomorphize ()
+{
+  auto context = Resolver::TypeCheckContext::get ();
+  for (const auto &subst : get_substs ())
+    {
+      const TyTy::ParamType *pty = subst.get_param_ty ();
+
+      if (!pty->can_resolve ())
+	continue;
+
+      const TyTy::BaseType *binding = pty->resolve ();
+      if (binding->get_kind () == TyTy::TypeKind::PARAM)
+	continue;
+
+      for (const auto &bound : pty->get_specified_bounds ())
+	{
+	  const Resolver::TraitReference *specified_bound_ref = bound.get ();
+
+	  // setup any associated type mappings for the specified bonds and this
+	  // type
+	  auto candidates = Resolver::TypeBoundsProbe::Probe (binding);
+
+	  Resolver::AssociatedImplTrait *associated_impl_trait = nullptr;
+	  for (auto &probed_bound : candidates)
+	    {
+	      const Resolver::TraitReference *bound_trait_ref
+		= probed_bound.first;
+	      const HIR::ImplBlock *associated_impl = probed_bound.second;
+
+	      HirId impl_block_id
+		= associated_impl->get_mappings ().get_hirid ();
+	      Resolver::AssociatedImplTrait *associated = nullptr;
+	      bool found_impl_trait
+		= context->lookup_associated_trait_impl (impl_block_id,
+							 &associated);
+	      rust_assert (found_impl_trait);
+
+	      bool found_trait
+		= specified_bound_ref->is_equal (*bound_trait_ref);
+	      bool found_self
+		= associated->get_self ()->can_eq (binding, false);
+	      if (found_trait && found_self)
+		{
+		  associated_impl_trait = associated;
+		  break;
+		}
+	    }
+
+	  if (associated_impl_trait != nullptr)
+	    {
+	      associated_impl_trait->setup_associated_types2 (binding, bound);
+	    }
+	}
+    }
+
+  return true;
+}
+
 void
 ADTType::accept_vis (TyVisitor &vis)
 {
@@ -951,7 +981,7 @@ ADTType::handle_substitions (SubstitutionArgumentMappings subst_mappings)
       bool ok
 	= subst_mappings.get_argument_for_symbol (sub.get_param_ty (), &arg);
       if (ok)
-	sub.fill_param_ty (*arg.get_tyty (), subst_mappings.get_locus ());
+	sub.fill_param_ty (subst_mappings, subst_mappings.get_locus ());
     }
 
   for (auto &variant : adt->get_variants ())
@@ -1196,7 +1226,7 @@ FnType::handle_substitions (SubstitutionArgumentMappings subst_mappings)
 	= subst_mappings.get_argument_for_symbol (sub.get_param_ty (), &arg);
       if (ok)
 	{
-	  sub.fill_param_ty (*arg.get_tyty (), subst_mappings.get_locus ());
+	  sub.fill_param_ty (subst_mappings, subst_mappings.get_locus ());
 	}
     }
 
@@ -2371,7 +2401,10 @@ ParamType::handle_substitions (SubstitutionArgumentMappings mappings)
   SubstitutionArg arg = SubstitutionArg::error ();
   bool ok = mappings.get_argument_for_symbol (this, &arg);
   if (ok && !arg.is_error ())
-    p->set_ty_ref (arg.get_tyty ()->get_ref ());
+    {
+      p->set_ty_ref (arg.get_tyty ()->get_ref ());
+      mappings.on_param_subst (*p, arg);
+    }
 
   return p;
 }
@@ -2658,7 +2691,7 @@ ProjectionType::handle_substitions (SubstitutionArgumentMappings subst_mappings)
       bool ok
 	= subst_mappings.get_argument_for_symbol (sub.get_param_ty (), &arg);
       if (ok)
-	sub.fill_param_ty (*arg.get_tyty (), subst_mappings.get_locus ());
+	sub.fill_param_ty (subst_mappings, subst_mappings.get_locus ());
     }
 
   auto fty = projection->base;
@@ -2935,17 +2968,7 @@ TypeCheckCallExpr::visit (FnType &type)
       return;
     }
 
-  if (type.get_return_type ()->get_kind () == TyTy::TypeKind::PLACEHOLDER)
-    {
-      const TyTy::PlaceholderType *p
-	= static_cast<const TyTy::PlaceholderType *> (type.get_return_type ());
-      if (p->can_resolve ())
-	{
-	  resolved = p->resolve ()->clone ();
-	  return;
-	}
-    }
-
+  type.monomorphize ();
   resolved = type.get_return_type ()->clone ();
 }
 
@@ -3050,6 +3073,7 @@ TypeCheckMethodCallExpr::visit (FnType &type)
       return;
     }
 
+  type.monomorphize ();
   resolved = type.get_return_type ()->clone ();
 }
 

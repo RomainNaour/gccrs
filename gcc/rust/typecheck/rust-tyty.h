@@ -93,9 +93,7 @@ public:
     return parent == nullptr || trait_item_ref == nullptr;
   }
 
-  BaseType *get_tyty_for_receiver (const TyTy::BaseType *receiver,
-				   const HIR::GenericArgs *bound_args
-				   = nullptr);
+  BaseType *get_tyty_for_receiver (const TyTy::BaseType *receiver);
 
   const Resolver::TraitItemReference *get_raw_item () const;
 
@@ -559,13 +557,16 @@ public:
     return param->get_name ();
   }
 
-  bool fill_param_ty (BaseType &type, Location locus);
+  bool fill_param_ty (SubstitutionArgumentMappings &subst_mappings,
+		      Location locus);
 
   SubstitutionParamMapping clone () const
   {
     return SubstitutionParamMapping (generic, static_cast<ParamType *> (
 						param->clone ()));
   }
+
+  ParamType *get_param_ty () { return param; }
 
   const ParamType *get_param_ty () const { return param; }
 
@@ -605,9 +606,12 @@ class SubstitutionArg
 {
 public:
   SubstitutionArg (const SubstitutionParamMapping *param, BaseType *argument)
-    : param (std::move (param)), argument (argument)
+    : param (param), argument (argument)
   {}
 
+  // FIXME
+  // the copy constructors need removed - they are unsafe see
+  // TypeBoundPredicate
   SubstitutionArg (const SubstitutionArg &other)
     : param (other.param), argument (other.argument)
   {}
@@ -651,16 +655,20 @@ private:
   BaseType *argument;
 };
 
+typedef std::function<void (const ParamType &, const SubstitutionArg &)>
+  ParamSubstCb;
 class SubstitutionArgumentMappings
 {
 public:
   SubstitutionArgumentMappings (std::vector<SubstitutionArg> mappings,
-				Location locus)
-    : mappings (mappings), locus (locus)
+				Location locus,
+				ParamSubstCb param_subst_cb = nullptr)
+    : mappings (mappings), locus (locus), param_subst_cb (param_subst_cb)
   {}
 
   SubstitutionArgumentMappings (const SubstitutionArgumentMappings &other)
-    : mappings (other.mappings), locus (other.locus)
+    : mappings (other.mappings), locus (other.locus),
+      param_subst_cb (other.param_subst_cb)
   {}
 
   SubstitutionArgumentMappings &
@@ -668,12 +676,14 @@ public:
   {
     mappings = other.mappings;
     locus = other.locus;
+    param_subst_cb = other.param_subst_cb;
+
     return *this;
   }
 
   static SubstitutionArgumentMappings error ()
   {
-    return SubstitutionArgumentMappings ({}, Location ());
+    return SubstitutionArgumentMappings ({}, Location (), nullptr);
   }
 
   bool is_error () const { return mappings.size () == 0; }
@@ -737,9 +747,18 @@ public:
     return "<" + buffer + ">";
   }
 
+  void on_param_subst (const ParamType &p, const SubstitutionArg &a) const
+  {
+    if (param_subst_cb == nullptr)
+      return;
+
+    param_subst_cb (p, a);
+  }
+
 private:
   std::vector<SubstitutionArg> mappings;
   Location locus;
+  ParamSubstCb param_subst_cb;
 };
 
 class SubstitutionRef
@@ -944,6 +963,10 @@ public:
     return handle_substitions (std::move (infer_arguments));
   }
 
+  // TODO comment
+  bool monomorphize ();
+
+  // TODO comment
   virtual BaseType *handle_substitions (SubstitutionArgumentMappings mappings)
     = 0;
 
@@ -992,11 +1015,8 @@ public:
   TypeBoundPredicateItem
   lookup_associated_item (const std::string &search) const;
 
-  HIR::GenericArgs *get_generic_args () { return &args; }
-
-  const HIR::GenericArgs *get_generic_args () const { return &args; }
-
-  bool has_generic_args () const { return args.has_generic_args (); }
+  TypeBoundPredicateItem
+  lookup_associated_item (const Resolver::TraitItemReference *ref) const;
 
   // WARNING THIS WILL ALWAYS RETURN NULLPTR
   BaseType *
@@ -1009,7 +1029,6 @@ public:
 private:
   DefId reference;
   Location locus;
-  HIR::GenericArgs args;
   bool error_flag;
 };
 

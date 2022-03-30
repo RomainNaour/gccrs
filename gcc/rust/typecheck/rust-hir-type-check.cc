@@ -341,6 +341,7 @@ TraitItemReference::get_type_from_fn (/*const*/ HIR::TraitItemFunc &fn) const
 			ABI::RUST, std::move (params), ret_type, substitutions);
 
   context->insert_type (fn.get_mappings (), resolved);
+
   return resolved;
 }
 
